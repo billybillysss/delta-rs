@@ -31,6 +31,7 @@ use crate::table::normalize_table_url;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 mod data_sink;
+mod delete_sink;
 pub(crate) mod next;
 
 const PATH_COLUMN: &str = "__delta_rs_path";
