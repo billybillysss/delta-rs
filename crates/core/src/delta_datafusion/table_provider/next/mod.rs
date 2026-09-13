@@ -48,7 +48,9 @@ use uuid::Uuid;
 pub use self::scan::DeltaScanExec;
 pub(crate) use self::scan::KernelScanPlan;
 use self::scan::ProjectedScanContract;
-use super::{data_sink::DeltaDataSink, delete_sink::DeltaDeleteSink};
+use super::{
+    data_sink::DeltaDataSink, delete_sink::DeltaDeleteSink, update_sink::DeltaUpdateSink,
+};
 use crate::DeltaTableError;
 use crate::delta_datafusion::DeltaScanConfig;
 use crate::delta_datafusion::engine::DataFusionEngine;
@@ -841,6 +843,49 @@ impl TableProvider for DeltaScan {
         let predicate = conjunction(filters);
         let input = Arc::new(EmptyExec::new(self.schema()));
         let data_sink = DeltaDeleteSink::new(log_store, snapshot, predicate, session);
+
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(data_sink),
+            None,
+        )))
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let log_store = self.log_store.clone().ok_or_else(|| {
+            DataFusionError::Plan(
+                "DeltaScan update requires a runtime log_store handle".to_string(),
+            )
+        })?;
+
+        super::update_datafusion_session(state, log_store.as_ref(), self.read_operation_id)?;
+
+        let snapshot = match &self.snapshot {
+            SnapshotWrapper::EagerSnapshot(esnap) => esnap.as_ref().clone(),
+            SnapshotWrapper::Snapshot(snap) => {
+                EagerSnapshot::try_new_with_snapshot(log_store.as_ref(), snap.clone()).await?
+            }
+        };
+
+        let session = state
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "DeltaScan update requires a DataFusion SessionState".to_string(),
+                )
+            })?
+            .clone();
+
+        let predicate = conjunction(filters);
+        let input = Arc::new(EmptyExec::new(self.schema()));
+        let data_sink =
+            DeltaUpdateSink::new(log_store, snapshot, assignments, predicate, session);
 
         Ok(Arc::new(DataSinkExec::new(
             input,
@@ -3153,6 +3198,111 @@ mod tests {
             .collect()
             .await?;
         assert_eq!(remaining.iter().map(|batch| batch.num_rows()).sum::<usize>(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_from_sql_mutates_only_during_execution() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", provider)?;
+        let version_before_planning = log_store.get_latest_version(0).await?;
+
+        let update = session
+            .sql("UPDATE delta_table SET id = id + 10 WHERE id >= 2")
+            .await?;
+
+        assert_eq!(
+            log_store.get_latest_version(0).await?,
+            version_before_planning,
+            "planning UPDATE must not commit a new Delta version",
+        );
+
+        let batches = update.collect().await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 2     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let read_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("updated", read_provider)?;
+        let updated = session
+            .sql("SELECT id FROM updated ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let expected = vec![
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 1  |",
+            "| 12 |",
+            "| 13 |",
+            "+----+",
+        ];
+        assert_batches_sorted_eq!(&expected, &updated);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_from_sql_without_filter_updates_all_rows() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", provider)?;
+
+        let batches = session
+            .sql("UPDATE delta_table SET id = id * 2")
+            .await?
+            .collect()
+            .await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 3     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let read_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("updated", read_provider)?;
+        let updated = session
+            .sql("SELECT id FROM updated ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let expected = vec![
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 2  |",
+            "| 4  |",
+            "| 6  |",
+            "+----+",
+        ];
+        assert_batches_sorted_eq!(&expected, &updated);
 
         Ok(())
     }
