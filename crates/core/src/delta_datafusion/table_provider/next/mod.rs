@@ -31,12 +31,13 @@ use std::{borrow::Cow, fmt, sync::Arc};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableType, sink::DataSinkExec};
-use datafusion::logical_expr::{TableProviderFilterPushDown, dml::InsertOp};
+use datafusion::logical_expr::{TableProviderFilterPushDown, dml::InsertOp, utils::conjunction};
 use datafusion::prelude::Expr;
 use datafusion::{
     catalog::{Session, TableProvider},
+    execution::context::SessionState,
     logical_expr::LogicalPlan,
-    physical_plan::ExecutionPlan,
+    physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
 use delta_kernel::{Engine, table_configuration::TableConfiguration, table_features::TableFeature};
 use object_store::path::Path;
@@ -47,7 +48,7 @@ use uuid::Uuid;
 pub use self::scan::DeltaScanExec;
 pub(crate) use self::scan::KernelScanPlan;
 use self::scan::ProjectedScanContract;
-use super::data_sink::DeltaDataSink;
+use super::{data_sink::DeltaDataSink, delete_sink::DeltaDeleteSink};
 use crate::DeltaTableError;
 use crate::delta_datafusion::DeltaScanConfig;
 use crate::delta_datafusion::engine::DataFusionEngine;
@@ -799,6 +800,47 @@ impl TableProvider for DeltaScan {
         };
 
         let data_sink = DeltaDataSink::new(log_store, snapshot, save_mode);
+
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(data_sink),
+            None,
+        )))
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let log_store = self.log_store.clone().ok_or_else(|| {
+            DataFusionError::Plan(
+                "DeltaScan delete_from requires a runtime log_store handle".to_string(),
+            )
+        })?;
+
+        super::update_datafusion_session(state, log_store.as_ref(), self.read_operation_id)?;
+
+        let snapshot = match &self.snapshot {
+            SnapshotWrapper::EagerSnapshot(esnap) => esnap.as_ref().clone(),
+            SnapshotWrapper::Snapshot(snap) => {
+                EagerSnapshot::try_new_with_snapshot(log_store.as_ref(), snap.clone()).await?
+            }
+        };
+
+        let session = state
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "DeltaScan delete_from requires a DataFusion SessionState".to_string(),
+                )
+            })?
+            .clone();
+
+        let predicate = conjunction(filters);
+        let input = Arc::new(EmptyExec::new(self.schema()));
+        let data_sink = DeltaDeleteSink::new(log_store, snapshot, predicate, session);
 
         Ok(Arc::new(DataSinkExec::new(
             input,
@@ -3024,4 +3066,95 @@ mod tests {
 
         Ok(())
     }
+    #[tokio::test]
+    async fn test_delete_from_sql_mutates_only_during_execution() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", provider)?;
+        let version_before_planning = log_store.get_latest_version(0).await?;
+
+        let delete = session
+            .sql("DELETE FROM delta_table WHERE id = 2")
+            .await?;
+
+        assert_eq!(
+            log_store.get_latest_version(0).await?,
+            version_before_planning,
+            "planning DELETE must not commit a new Delta version",
+        );
+
+        let batches = delete.collect().await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 1     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let read_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("remaining", read_provider)?;
+        let remaining = session
+            .sql("SELECT id FROM remaining ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let expected = vec![
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 1  |",
+            "| 3  |",
+            "+----+",
+        ];
+        assert_batches_sorted_eq!(&expected, &remaining);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_without_filter_deletes_all_rows() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", provider)?;
+
+        let batches = session.sql("DELETE FROM delta_table").await?.collect().await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 3     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let read_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("remaining", read_provider)?;
+        let remaining = session
+            .sql("SELECT id FROM remaining")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(remaining.iter().map(|batch| batch.num_rows()).sum::<usize>(), 0);
+
+        Ok(())
+    }
+
 }
