@@ -839,8 +839,9 @@ impl TableProvider for DeltaScan {
             .clone();
 
         let predicate = conjunction(filters);
-        let input = Arc::new(EmptyExec::new(self.schema()));
-        let data_sink = DeltaDeleteSink::new(log_store, snapshot, predicate, session);
+        let sink_schema = self.scan_schema.clone();
+        let input = Arc::new(EmptyExec::new(sink_schema.clone()));
+        let data_sink = DeltaDeleteSink::new(log_store, snapshot, predicate, session, sink_schema);
 
         Ok(Arc::new(DataSinkExec::new(
             input,
@@ -926,11 +927,16 @@ mod tests {
     use datafusion_datasource::file::FileSource as _;
     use datafusion_datasource::source::DataSourceExec;
     use futures::{StreamExt as _, TryStreamExt as _};
+    use object_store::ObjectStoreExt as _;
     use parquet::file::reader::FileReader as _;
     use parquet::file::serialized_reader::SerializedFileReader;
+    use rstest::rstest;
     use std::{
         fs::File,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use url::Url;
 
@@ -939,19 +945,44 @@ mod tests {
         assert_batches_sorted_eq,
         delta_datafusion::{DeltaScanConfig, session::create_session},
         kernel::{
-            Action, DataType, EagerSnapshot, PrimitiveType, ProtocolInner, Snapshot, StructField,
-            StructType,
+            Action, ActiveAddOptions, Add, AddStatsPolicy, DataType, EagerSnapshot, PrimitiveType,
+            ProtocolInner, Snapshot, StructField, StructType,
         },
         logstore::get_actions,
         operations::create::CreateBuilder,
         test_utils::{
-            TestResult, TestTables, make_test_add,
+            TestResult, TestTables,
+            datafusion::make_test_scalar_udf,
+            make_test_add,
             object_store::{
+                RecordedObjectStoreOperation, RecordedPathKind,
                 drain_recorded_object_store_operations as drain_recorded_ops, recording_log_store,
             },
             open_fs_path,
         },
     };
+
+    #[derive(Debug)]
+    struct CountingQueryPlanner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::execution::context::QueryPlanner for CountingQueryPlanner {
+        async fn create_physical_plan(
+            &self,
+            logical_plan: &LogicalPlan,
+            session: &dyn Session,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            datafusion::execution::context::QueryPlanner::create_physical_plan(
+                crate::delta_datafusion::planner::DeltaPlanner::new().as_ref(),
+                logical_plan,
+                session,
+            )
+            .await
+        }
+    }
 
     #[test]
     fn test_canonical_table_root_identity_strips_username_query_and_fragment() {
@@ -1126,6 +1157,75 @@ mod tests {
             vec![Arc::new(Int64Array::from(values))],
         )?;
         table.write(vec![batch]).await
+    }
+
+    async fn create_partition_table(stats: Option<&str>) -> TestResult<crate::DeltaTable> {
+        use std::collections::HashMap;
+
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use object_store::{ObjectStoreExt, PutPayload};
+
+        let delta_schema = StructType::try_new(vec![
+            StructField::new(
+                "part".to_string(),
+                DataType::Primitive(PrimitiveType::String),
+                true,
+            ),
+            StructField::new(
+                "id".to_string(),
+                DataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+        ])?;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("part", ArrowDataType::Utf8, true),
+            ArrowField::new("id", ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )?;
+        let bytes = crate::test_utils::get_parquet_bytes(&batch)?;
+        let path = "part-00000.parquet";
+        let add = Add {
+            path: path.to_string(),
+            partition_values: HashMap::from([(String::from("part"), Some(String::from("a")))]),
+            size: bytes.len() as i64,
+            modification_time: chrono::Utc::now().timestamp_millis(),
+            data_change: true,
+            stats: stats.map(str::to_owned),
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+        };
+        let table = crate::DeltaTable::new_in_memory()
+            .create()
+            .with_columns(delta_schema.fields().cloned())
+            .with_partition_columns(vec!["part"])
+            .with_actions(vec![Action::Add(add)])
+            .await?;
+        table
+            .object_store()
+            .put(&Path::from(path), PutPayload::from(bytes))
+            .await?;
+        Ok(table)
+    }
+
+    fn is_data_read(operation: &RecordedObjectStoreOperation) -> bool {
+        matches!(
+            operation,
+            RecordedObjectStoreOperation::Get(RecordedPathKind::Data)
+                | RecordedObjectStoreOperation::GetOpts(RecordedPathKind::Data)
+                | RecordedObjectStoreOperation::GetRange(RecordedPathKind::Data, _)
+                | RecordedObjectStoreOperation::GetRanges(RecordedPathKind::Data, _)
+                | RecordedObjectStoreOperation::Head(RecordedPathKind::Data)
+        )
     }
 
     async fn create_in_memory_id_table_with_unsupported_reader_protocol()
@@ -3069,24 +3169,30 @@ mod tests {
     #[tokio::test]
     async fn test_delete_from_sql_mutates_only_during_execution() -> TestResult {
         let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
-        let log_store = table.log_store();
+        let (log_store, mut operations) = recording_log_store(table.log_store());
         let provider = DeltaScan::builder()
             .with_log_store(log_store.clone())
             .build()
             .await?;
+        drain_recorded_ops(&mut operations).await;
 
         let session = Arc::new(create_session().into_inner());
-        session.register_table("delta_table", provider)?;
+        session.register_table("delta_table", Arc::new(provider))?;
         let version_before_planning = log_store.get_latest_version(0).await?;
 
-        let delete = session
-            .sql("DELETE FROM delta_table WHERE id = 2")
-            .await?;
+        let delete = session.sql("DELETE FROM delta_table WHERE id = 2").await?;
 
         assert_eq!(
             log_store.get_latest_version(0).await?,
             version_before_planning,
             "planning DELETE must not commit a new Delta version",
+        );
+        let planning_operations = drain_recorded_ops(&mut operations).await;
+        assert!(
+            planning_operations
+                .iter()
+                .all(|operation| !is_data_read(operation)),
+            "planning DELETE read data files: {planning_operations:?}",
         );
 
         let batches = delete.collect().await?;
@@ -3108,15 +3214,359 @@ mod tests {
             .await?
             .collect()
             .await?;
+        let expected = vec!["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
+        assert_batches_sorted_eq!(&expected, &remaining);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case("FALSE")]
+    #[case("NULL")]
+    #[case("1 = 0")]
+    #[tokio::test]
+    async fn test_delete_from_sql_constant_false_is_noop(#[case] predicate: &str) -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+        let version = table.version().unwrap();
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let batches = session
+            .sql(&format!("DELETE FROM delta_table WHERE {predicate}"))
+            .await?
+            .collect()
+            .await?;
+
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 0     |",
+                "+-------+",
+            ],
+            &batches
+        );
+        assert_eq!(log_store.get_latest_version(version).await?, version);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case("DELETE FROM delta_table LIMIT 0", false)]
+    #[case("DELETE FROM delta_table LIMIT 1", true)]
+    #[case("DELETE FROM delta_table WHERE id > 1 LIMIT 1", true)]
+    #[tokio::test]
+    async fn test_delete_from_sql_handles_limit_safely(
+        #[case] sql: &str,
+        #[case] rejects: bool,
+    ) -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+        let version = table.version().unwrap();
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let result = session.sql(sql).await?.collect().await;
+        if rejects {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("DELETE with LIMIT is not supported"),
+                "unexpected error: {error}"
+            );
+        } else {
+            datafusion::assert_batches_eq!(
+                [
+                    "+-------+",
+                    "| count |",
+                    "+-------+",
+                    "| 0     |",
+                    "+-------+",
+                ],
+                &result?
+            );
+        }
+        assert_eq!(log_store.get_latest_version(version).await?, version);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_with_file_column_uses_sink_schema() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let provider = DeltaScan::new(
+            table.snapshot()?.snapshot().clone(),
+            DeltaScanConfig::default().with_file_column_name("source_file"),
+        )?
+        .with_log_store(table.log_store());
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let batches = session
+            .sql("DELETE FROM delta_table")
+            .await?
+            .collect()
+            .await?;
+
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 3     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_preserves_caller_session_udf() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store)
+            .build()
+            .await?;
+
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let state = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+            create_session().into_inner().state(),
+        )
+        .with_query_planner(Arc::new(CountingQueryPlanner {
+            calls: planner_calls.clone(),
+        }))
+        .build();
+        let session = Arc::new(datafusion::prelude::SessionContext::new_with_state(state));
+        session.register_udf((*make_test_scalar_udf("caller_only_delete_udf")).clone());
+        session.register_table("delta_table", Arc::new(provider))?;
+
+        let batches = session
+            .sql("DELETE FROM delta_table WHERE caller_only_delete_udf(id) = 1")
+            .await?
+            .collect()
+            .await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 3     |",
+                "+-------+",
+            ],
+            &batches
+        );
+        assert!(
+            planner_calls.load(Ordering::Relaxed) > 1,
+            "DELETE execution did not reuse the caller query planner"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_rewrites_only_matching_rows() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2]).await?;
+        let append_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                ArrowDataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![10, 11]))],
+        )?;
+        let mut table = table
+            .write(vec![append_batch])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+        let original_paths: std::collections::HashSet<_> = table
+            .snapshot()?
+            .snapshot()
+            .snapshot()
+            .active_adds(
+                table.log_store().as_ref(),
+                ActiveAddOptions {
+                    predicate: None,
+                    stats: AddStatsPolicy::None,
+                },
+            )
+            .map_ok(|file| file.path_raw().to_string())
+            .try_collect()
+            .await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let batches = session
+            .sql("DELETE FROM delta_table WHERE id = 2")
+            .await?
+            .collect()
+            .await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 1     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let remaining_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("remaining", remaining_provider)?;
+        let remaining = session
+            .sql("SELECT id FROM remaining ORDER BY id")
+            .await?
+            .collect()
+            .await?;
         let expected = vec![
-            "+----+",
-            "| id |",
-            "+----+",
-            "| 1  |",
-            "| 3  |",
-            "+----+",
+            "+----+", "| id |", "+----+", "| 1  |", "| 10 |", "| 11 |", "+----+",
         ];
         assert_batches_sorted_eq!(&expected, &remaining);
+        table.load().await?;
+        let remaining_paths: std::collections::HashSet<_> = table
+            .snapshot()?
+            .snapshot()
+            .snapshot()
+            .active_adds(
+                table.log_store().as_ref(),
+                ActiveAddOptions {
+                    predicate: None,
+                    stats: AddStatsPolicy::None,
+                },
+            )
+            .map_ok(|file| file.path_raw().to_string())
+            .try_collect()
+            .await?;
+        assert_eq!(remaining_paths.intersection(&original_paths).count(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_partition_fast_path_uses_stats_without_data_read() -> TestResult {
+        let mut table = create_partition_table(Some(r#"{"numRecords":2}"#)).await?;
+        let (log_store, mut operations) = recording_log_store(table.log_store());
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store)
+            .build()
+            .await?;
+        drain_recorded_ops(&mut operations).await;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let batches = session
+            .sql("DELETE FROM delta_table WHERE part = 'a'")
+            .await?
+            .collect()
+            .await?;
+
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 2     |",
+                "+-------+",
+            ],
+            &batches
+        );
+        let execution_operations = drain_recorded_ops(&mut operations).await;
+        assert!(
+            execution_operations
+                .iter()
+                .all(|operation| !is_data_read(operation)),
+            "metadata-only partition DELETE read data files: {execution_operations:?}",
+        );
+        table.load().await?;
+        assert_eq!(table.snapshot()?.log_data().num_files(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_fallback_counts_original_snapshot_without_stats() -> TestResult {
+        let table = create_partition_table(None).await?;
+        let (log_store, mut operations) = recording_log_store(table.log_store());
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store)
+            .build()
+            .await?;
+        drain_recorded_ops(&mut operations).await;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let batches = session
+            .sql("DELETE FROM delta_table WHERE part = 'a'")
+            .await?
+            .collect()
+            .await?;
+
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 2     |",
+                "+-------+",
+            ],
+            &batches
+        );
+        let execution_operations = drain_recorded_ops(&mut operations).await;
+        assert!(
+            execution_operations.iter().any(is_data_read),
+            "missing-statistics DELETE did not execute the fallback data count: {execution_operations:?}",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_sql_fallback_failure_does_not_commit() -> TestResult {
+        let table = create_partition_table(None).await?;
+        let log_store = table.log_store();
+        let version = table.version().unwrap();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+        table
+            .object_store()
+            .delete(&object_store::path::Path::from("part-00000.parquet"))
+            .await?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let error = session
+            .sql("DELETE FROM delta_table WHERE part = 'a'")
+            .await?
+            .collect()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("part-00000.parquet"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(log_store.get_latest_version(version).await?, version);
 
         Ok(())
     }
@@ -3131,9 +3581,13 @@ mod tests {
             .await?;
 
         let session = Arc::new(create_session().into_inner());
-        session.register_table("delta_table", provider)?;
+        session.register_table("delta_table", Arc::new(provider))?;
 
-        let batches = session.sql("DELETE FROM delta_table").await?.collect().await?;
+        let batches = session
+            .sql("DELETE FROM delta_table")
+            .await?
+            .collect()
+            .await?;
         datafusion::assert_batches_eq!(
             [
                 "+-------+",
@@ -3152,9 +3606,14 @@ mod tests {
             .await?
             .collect()
             .await?;
-        assert_eq!(remaining.iter().map(|batch| batch.num_rows()).sum::<usize>(), 0);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            0
+        );
 
         Ok(())
     }
-
 }

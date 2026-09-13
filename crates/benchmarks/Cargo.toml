@@ -19,6 +19,7 @@ chrono = { workspace = true, default-features = false, features = ["clock"] }
 futures = { workspace = true }
 object_store = { workspace = true }
 anyhow = "1"
+parquet = { workspace = true }
 
 [dependencies.deltalake-core]
 path = "../core"
@@ -27,6 +28,10 @@ features = ["datafusion"]
 
 [dev-dependencies]
 divan = "0.1"
+
+[[bench]]
+name = "delete"
+harness = false
 
 [[bench]]
 name = "merge"

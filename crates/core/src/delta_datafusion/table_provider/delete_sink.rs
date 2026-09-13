@@ -3,10 +3,7 @@ use std::{fmt, sync::Arc};
 use arrow_schema::SchemaRef;
 use datafusion::{
     error::DataFusionError,
-    execution::{
-        SendableRecordBatchStream, TaskContext,
-        context::{SessionContext, SessionState},
-    },
+    execution::{SendableRecordBatchStream, TaskContext, context::SessionState},
     physical_plan::{
         DisplayAs, DisplayFormatType,
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
@@ -16,13 +13,7 @@ use datafusion::{
 use datafusion_datasource::sink::DataSink;
 use futures::TryStreamExt as _;
 
-use super::next::DeltaScan;
-use crate::{
-    delta_datafusion::DeltaScanConfig,
-    kernel::EagerSnapshot,
-    logstore::LogStoreRef,
-    operations::delete::DeleteBuilder,
-};
+use crate::{kernel::EagerSnapshot, logstore::LogStoreRef, operations::delete::DeleteBuilder};
 
 /// A DataFusion sink that performs a Delta DELETE when its execution plan is consumed.
 #[derive(Debug)]
@@ -41,37 +32,16 @@ impl DeltaDeleteSink {
         snapshot: EagerSnapshot,
         predicate: Option<Expr>,
         session: SessionState,
+        schema: SchemaRef,
     ) -> Self {
         Self {
             log_store,
-            schema: snapshot.read_schema(),
+            schema,
             snapshot,
             predicate,
             session,
             metrics: ExecutionPlanMetricsSet::new(),
         }
-    }
-
-    async fn count_matching_rows(&self) -> datafusion::common::Result<u64> {
-        let provider = DeltaScan::new(
-            self.snapshot.clone(),
-            DeltaScanConfig::new_from_session(&self.session),
-        )?
-        .with_log_store(self.log_store.clone());
-        let context = SessionContext::new_with_state(self.session.clone());
-        let mut dataframe = context.read_table(Arc::new(provider))?;
-        if let Some(predicate) = &self.predicate {
-            dataframe = dataframe.filter(predicate.clone())?;
-        }
-
-        let mut stream = dataframe.execute_stream().await?;
-        let mut count = 0_u64;
-        while let Some(batch) = stream.try_next().await? {
-            count = count
-                .checked_add(batch.num_rows() as u64)
-                .ok_or_else(|| DataFusionError::Execution("DELETE row count overflowed u64".into()))?;
-        }
-        Ok(count)
     }
 }
 
@@ -94,11 +64,9 @@ impl DataSink for DeltaDeleteSink {
         // starting the transaction so planning can never mutate the table.
         while data.try_next().await?.is_some() {}
 
-        let mut delete = DeleteBuilder::new(
-            self.log_store.clone(),
-            Some(self.snapshot.clone()),
-        )
-        .with_session_state(Arc::new(self.session.clone()));
+        let mut delete = DeleteBuilder::new(self.log_store.clone(), Some(self.snapshot.clone()))
+            .with_session_state(Arc::new(self.session.clone()))
+            .with_exact_row_count();
 
         if let Some(predicate) = &self.predicate {
             delete = delete.with_predicate(predicate.clone());
@@ -108,12 +76,11 @@ impl DataSink for DeltaDeleteSink {
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
-        match metrics.num_deleted_rows {
-            Some(count) => u64::try_from(count).map_err(|_| {
-                DataFusionError::Execution("DELETE row count did not fit u64".into())
-            }),
-            None => self.count_matching_rows().await,
-        }
+        let count = metrics.num_deleted_rows.ok_or_else(|| {
+            DataFusionError::Execution("DELETE did not produce an exact row count".into())
+        })?;
+        u64::try_from(count)
+            .map_err(|_| DataFusionError::Execution("DELETE row count did not fit u64".into()))
     }
 }
 

@@ -26,7 +26,8 @@ This will generate a folder called `tpcds_parquet` containing many parquet files
 
 ## Running benchmarks
 
-Benchmarks use Divan and time only the merge operation. A temporary Delta table is created per iteration from `web_returns.parquet` and removed afterwards.
+Benchmarks use Divan. Merge benchmarks time only the merge operation; their temporary
+Delta tables are created per iteration from `web_returns.parquet` and removed afterwards.
 
 Environment variables:
 - `TPCDS_PARQUET_DIR` (optional): directory containing `web_returns.parquet`. Default: `crates/benchmarks/data/tpcds_parquet`.
@@ -35,6 +36,17 @@ From the repo root:
 ```
 cargo bench -p delta-benchmarks --bench merge
 ```
+
+SQL DELETE metadata-count and exact-count comparison:
+
+```bash
+cargo bench -p delta-benchmarks --bench delete
+```
+
+The DELETE suite creates a one-file, 1,024-row in-memory table outside the timed section.
+The SQL cases include SQL planning, DELETE execution, and commit. The missing-statistics
+SQL case also performs an exact pre-commit count; the corresponding direct API case
+deliberately reports an unknown row count and is labeled accordingly.
 
 Filter a specific suite:
 ```

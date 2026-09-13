@@ -22,11 +22,16 @@
 //! };
 //!
 //! let state = state.with_query_planner(Arc::new(merge_planner));
-use std::sync::{Arc, LazyLock};
+use std::{
+    any::TypeId,
+    sync::{Arc, LazyLock},
+};
 
+use arrow_array::{RecordBatch, UInt64Array};
 use async_trait::async_trait;
+use datafusion::datasource::{memory::MemorySourceConfig, source_as_provider};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode, WriteOp};
 use datafusion::physical_planner::PhysicalPlanner;
 use datafusion::{
     catalog::Session,
@@ -35,8 +40,8 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner},
 };
 
-use crate::delta_datafusion::DataFusionResult;
 use crate::delta_datafusion::data_validation::DataValidationExtensionPlanner;
+use crate::delta_datafusion::{DataFusionResult, DeltaScanNext};
 use crate::operations::delete::DeleteMetricExtensionPlanner;
 use crate::operations::merge::MergeMetricExtensionPlanner;
 use crate::operations::update::UpdateMetricExtensionPlanner;
@@ -76,11 +81,41 @@ impl QueryPlanner for DeltaPlanner {
         logical_plan: &LogicalPlan,
         session: &dyn Session,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if let LogicalPlan::Dml(dml) = logical_plan
+            && dml.op == WriteOp::Delete
+            && source_as_provider(&dml.target)
+                .is_ok_and(|provider| provider.as_ref().type_id() == TypeId::of::<DeltaScanNext>())
+        {
+            if contains_limit(&dml.input) {
+                return Err(datafusion::error::DataFusionError::Plan(
+                    "DELETE with LIMIT is not supported".to_string(),
+                ));
+            }
+
+            if matches!(dml.input.as_ref(), LogicalPlan::EmptyRelation(empty) if !empty.produce_one_row)
+            {
+                let schema = Arc::new(dml.output_schema.as_arrow().clone());
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(UInt64Array::from(vec![0]))],
+                )?;
+                return Ok(MemorySourceConfig::try_new_exec(
+                    &[vec![batch]],
+                    schema,
+                    None,
+                )?);
+            }
+        }
+
         let planner = Arc::new(Box::new(DefaultPhysicalPlanner::with_extension_planners(
             vec![DeltaExtensionPlanner::new()],
         )));
         planner.create_physical_plan(logical_plan, session).await
     }
+}
+
+fn contains_limit(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Limit(_)) || plan.inputs().into_iter().any(contains_limit)
 }
 
 /// Extension [`PhysicalPlanner`](datafusion::physical_planner::PhysicalPlanner) that knows
