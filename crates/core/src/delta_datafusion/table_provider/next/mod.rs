@@ -29,9 +29,13 @@ use std::collections::HashSet;
 use std::{borrow::Cow, fmt, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result};
 use datafusion::datasource::{TableType, sink::DataSinkExec};
-use datafusion::logical_expr::{TableProviderFilterPushDown, dml::InsertOp, utils::conjunction};
+use datafusion::logical_expr::{
+    TableProviderFilterPushDown,
+    dml::{InsertOp, MergeIntoClause},
+    utils::conjunction,
+};
 use datafusion::prelude::Expr;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -49,7 +53,8 @@ pub use self::scan::DeltaScanExec;
 pub(crate) use self::scan::KernelScanPlan;
 use self::scan::ProjectedScanContract;
 use super::{
-    data_sink::DeltaDataSink, delete_sink::DeltaDeleteSink, update_sink::DeltaUpdateSink,
+    data_sink::DeltaDataSink, delete_sink::DeltaDeleteSink, merge_sink::DeltaMergeSink,
+    update_sink::DeltaUpdateSink,
 };
 use crate::DeltaTableError;
 use crate::delta_datafusion::DeltaScanConfig;
@@ -62,6 +67,26 @@ use crate::protocol::SaveMode;
 use crate::table::normalize_table_url;
 
 mod scan;
+
+fn merge_relation_alias(
+    schema: &DFSchema,
+    start: usize,
+    length: usize,
+    relation: &str,
+) -> Result<Option<String>> {
+    let qualifiers: HashSet<_> = schema
+        .iter()
+        .skip(start)
+        .take(length)
+        .map(|(qualifier, _)| qualifier.map(ToString::to_string))
+        .collect();
+    if qualifiers.len() > 1 {
+        return Err(DataFusionError::Plan(format!(
+            "MERGE {relation} columns have inconsistent relation qualifiers"
+        )));
+    }
+    Ok(qualifiers.into_iter().next().flatten())
+}
 
 /// Default column name for the file id column we add to files read from disk.
 pub(crate) use crate::delta_datafusion::file_id::FILE_ID_COLUMN_DEFAULT;
@@ -886,6 +911,73 @@ impl TableProvider for DeltaScan {
         let input = Arc::new(EmptyExec::new(self.schema()));
         let data_sink =
             DeltaUpdateSink::new(log_store, snapshot, assignments, predicate, session);
+
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(data_sink),
+            None,
+        )))
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let log_store = self.log_store.clone().ok_or_else(|| {
+            DataFusionError::Plan(
+                "DeltaScan merge_into requires a runtime log_store handle".to_string(),
+            )
+        })?;
+
+        super::update_datafusion_session(state, log_store.as_ref(), self.read_operation_id)?;
+
+        let snapshot = match &self.snapshot {
+            SnapshotWrapper::EagerSnapshot(esnap) => esnap.as_ref().clone(),
+            SnapshotWrapper::Snapshot(snap) => {
+                EagerSnapshot::try_new_with_snapshot(log_store.as_ref(), snap.clone()).await?
+            }
+        };
+
+        let session = state
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "DeltaScan merge_into requires a DataFusion SessionState".to_string(),
+                )
+            })?
+            .clone();
+
+        let target_fields = self.schema().fields().len();
+        let source_fields = source.schema().fields().len();
+        if merge_schema.fields().len() != target_fields + source_fields {
+            return Err(DataFusionError::Plan(format!(
+                "MERGE schema has {} fields, expected {} target plus {} source fields",
+                merge_schema.fields().len(),
+                target_fields,
+                source_fields
+            )));
+        }
+        let target_alias =
+            merge_relation_alias(&merge_schema, 0, target_fields, "target")?;
+        let source_alias =
+            merge_relation_alias(&merge_schema, target_fields, source_fields, "source")?;
+
+        let input = Arc::new(EmptyExec::new(self.schema()));
+        let data_sink = DeltaMergeSink::new(
+            log_store,
+            snapshot,
+            source,
+            on,
+            clauses,
+            source_alias,
+            target_alias,
+            session,
+        );
 
         Ok(Arc::new(DataSinkExec::new(
             input,
@@ -3303,6 +3395,145 @@ mod tests {
             "+----+",
         ];
         assert_batches_sorted_eq!(&expected, &updated);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_from_sql_streams_source_and_defers_execution() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2, 4]))],
+        )?;
+        let source = MemTable::try_new(source_schema, vec![vec![source_batch]])?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", provider)?;
+        session.register_table("source_table", Arc::new(source))?;
+        let version_before_planning = log_store.get_latest_version(0).await?;
+
+        let merge = session
+            .sql(
+                "MERGE INTO delta_table AS target \
+                 USING source_table AS source \
+                 ON target.id = source.id \
+                 WHEN MATCHED THEN UPDATE SET id = source.id + 10 \
+                 WHEN NOT MATCHED THEN INSERT (id) VALUES (source.id)",
+            )
+            .await?;
+
+        assert_eq!(
+            log_store.get_latest_version(0).await?,
+            version_before_planning,
+            "planning MERGE must not commit a new Delta version",
+        );
+
+        let batches = merge.collect().await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 2     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let read_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("merged", read_provider)?;
+        let merged = session
+            .sql("SELECT id FROM merged ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let expected = vec![
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 1  |",
+            "| 3  |",
+            "| 4  |",
+            "| 12 |",
+            "+----+",
+        ];
+        assert_batches_sorted_eq!(&expected, &merged);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_from_sql_preserves_clause_order_and_not_matched_by_source() -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2, 3]))],
+        )?;
+        let source = MemTable::try_new(source_schema, vec![vec![source_batch]])?;
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", provider)?;
+        session.register_table("source_table", Arc::new(source))?;
+
+        let batches = session
+            .sql(
+                "MERGE INTO delta_table AS target \
+                 USING source_table AS source \
+                 ON target.id = source.id \
+                 WHEN MATCHED AND source.id = 2 THEN DELETE \
+                 WHEN MATCHED THEN UPDATE SET id = target.id + 10 \
+                 WHEN NOT MATCHED BY SOURCE THEN DELETE",
+            )
+            .await?
+            .collect()
+            .await?;
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 3     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let read_provider = DeltaScan::builder().with_log_store(log_store).await?;
+        session.register_table("merged", read_provider)?;
+        let merged = session
+            .sql("SELECT id FROM merged")
+            .await?
+            .collect()
+            .await?;
+        let expected = vec![
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 13 |",
+            "+----+",
+        ];
+        assert_batches_sorted_eq!(&expected, &merged);
 
         Ok(())
     }
