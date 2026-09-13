@@ -105,7 +105,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn delete_cases_have_expected_count_semantics() -> anyhow::Result<()> {
+    async fn delete_operations_report_expected_row_counts() -> anyhow::Result<()> {
         let sql = run_sql_delete(&prepare_delete_input(None).await?).await?;
         let count = sql[0]
             .column(0)

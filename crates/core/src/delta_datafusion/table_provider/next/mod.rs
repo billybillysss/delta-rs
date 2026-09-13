@@ -3225,7 +3225,9 @@ mod tests {
     #[case("NULL")]
     #[case("1 = 0")]
     #[tokio::test]
-    async fn test_delete_from_sql_constant_false_is_noop(#[case] predicate: &str) -> TestResult {
+    async fn test_delete_from_sql_non_true_constant_predicates_are_noop(
+        #[case] predicate: &str,
+    ) -> TestResult {
         let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
         let log_store = table.log_store();
         let provider = DeltaScan::builder()
@@ -3258,14 +3260,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case("DELETE FROM delta_table LIMIT 0", false)]
-    #[case("DELETE FROM delta_table LIMIT 1", true)]
-    #[case("DELETE FROM delta_table WHERE id > 1 LIMIT 1", true)]
     #[tokio::test]
-    async fn test_delete_from_sql_handles_limit_safely(
-        #[case] sql: &str,
-        #[case] rejects: bool,
-    ) -> TestResult {
+    async fn test_delete_from_sql_limit_zero_is_noop() -> TestResult {
         let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
         let log_store = table.log_store();
         let provider = DeltaScan::builder()
@@ -3276,34 +3272,57 @@ mod tests {
 
         let session = Arc::new(create_session().into_inner());
         session.register_table("delta_table", Arc::new(provider))?;
-        let result = session.sql(sql).await?.collect().await;
-        if rejects {
-            let error = result.unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("DELETE with LIMIT is not supported"),
-                "unexpected error: {error}"
-            );
-        } else {
-            datafusion::assert_batches_eq!(
-                [
-                    "+-------+",
-                    "| count |",
-                    "+-------+",
-                    "| 0     |",
-                    "+-------+",
-                ],
-                &result?
-            );
-        }
+        let batches = session
+            .sql("DELETE FROM delta_table LIMIT 0")
+            .await?
+            .collect()
+            .await?;
+
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+",
+                "| count |",
+                "+-------+",
+                "| 0     |",
+                "+-------+",
+            ],
+            &batches
+        );
+        assert_eq!(log_store.get_latest_version(version).await?, version);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case("DELETE FROM delta_table LIMIT 1")]
+    #[case("DELETE FROM delta_table WHERE id > 1 LIMIT 1")]
+    #[tokio::test]
+    async fn test_delete_from_sql_rejects_positive_limit(#[case] sql: &str) -> TestResult {
+        let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
+        let log_store = table.log_store();
+        let provider = DeltaScan::builder()
+            .with_log_store(log_store.clone())
+            .build()
+            .await?;
+        let version = table.version().unwrap();
+
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("delta_table", Arc::new(provider))?;
+        let error = session.sql(sql).await?.collect().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DELETE with LIMIT is not supported"),
+            "unexpected error: {error}"
+        );
         assert_eq!(log_store.get_latest_version(version).await?, version);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_delete_from_sql_with_file_column_uses_sink_schema() -> TestResult {
+    async fn test_delete_from_sql_with_configured_file_column_uses_matching_sink_schema()
+    -> TestResult {
         let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
         let provider = DeltaScan::new(
             table.snapshot()?.snapshot().clone(),
@@ -3334,7 +3353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_from_sql_preserves_caller_session_udf() -> TestResult {
+    async fn test_delete_from_sql_uses_caller_session_state() -> TestResult {
         let table = create_in_memory_id_table_with_rows(vec![1, 2, 3]).await?;
         let log_store = table.log_store();
         let provider = DeltaScan::builder()
@@ -3378,7 +3397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_from_sql_rewrites_only_matching_rows() -> TestResult {
+    async fn test_delete_from_sql_rewrites_only_files_with_matching_rows() -> TestResult {
         let table = create_in_memory_id_table_with_rows(vec![1, 2]).await?;
         let append_batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -3462,7 +3481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_from_sql_partition_fast_path_uses_stats_without_data_read() -> TestResult {
+    async fn test_delete_from_sql_partition_predicate_uses_stats_without_data_read() -> TestResult {
         let mut table = create_partition_table(Some(r#"{"numRecords":2}"#)).await?;
         let (log_store, mut operations) = recording_log_store(table.log_store());
         let provider = DeltaScan::builder()
@@ -3503,7 +3522,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_from_sql_fallback_counts_original_snapshot_without_stats() -> TestResult {
+    async fn test_delete_from_sql_missing_stats_returns_exact_count_from_original_snapshot()
+    -> TestResult {
         let table = create_partition_table(None).await?;
         let (log_store, mut operations) = recording_log_store(table.log_store());
         let provider = DeltaScan::builder()
@@ -3540,7 +3560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_from_sql_fallback_failure_does_not_commit() -> TestResult {
+    async fn test_delete_from_sql_does_not_commit_when_exact_count_fails() -> TestResult {
         let table = create_partition_table(None).await?;
         let log_store = table.log_store();
         let version = table.version().unwrap();

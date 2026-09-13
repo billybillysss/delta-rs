@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_nested_parquet_data_with_custom_name() {
+    fn classifies_nested_parquet_paths_as_data() {
         let path = Path::from("part=a/custom-name.parquet");
         assert_eq!(classify_path(&path), RecordedPathKind::Data);
     }

@@ -37,16 +37,15 @@ From the repo root:
 cargo bench -p delta-benchmarks --bench merge
 ```
 
-SQL DELETE metadata-count and exact-count comparison:
+### DELETE benchmarks
 
 ```bash
 cargo bench -p delta-benchmarks --bench delete
 ```
 
-The DELETE suite creates a one-file, 1,024-row in-memory table outside the timed section.
-The SQL cases include SQL planning, DELETE execution, and commit. The missing-statistics
-SQL case also performs an exact pre-commit count; the corresponding direct API case
-deliberately reports an unknown row count and is labeled accordingly.
+The benchmark prepares a one-file, 1,024-row in-memory table outside the timed section.
+SQL benchmarks include planning, execution, and commit; the missing-statistics case also
+performs an exact pre-commit count, while the direct API case reports an unknown count.
 
 Filter a specific suite:
 ```
