@@ -1,3 +1,4 @@
+pub mod delete;
 pub mod latency_store;
 pub mod merge;
 pub mod smoke;
@@ -5,6 +6,7 @@ pub mod tpcds_queries;
 pub mod vacuum;
 pub mod write;
 
+pub use delete::{prepare_delete_input, run_direct_delete, run_sql_delete, DeleteInput};
 pub use latency_store::LatencyStore;
 pub use merge::{
     delete_only_cases, insert_only_cases, merge_case_by_name, merge_case_names, merge_delete,

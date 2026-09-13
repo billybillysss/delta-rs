@@ -44,6 +44,7 @@ use datafusion::catalog::Session;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{ToDFSchema as _, exec_datafusion_err};
 use datafusion::error::Result as DataFusionResult;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, lit};
@@ -109,6 +110,7 @@ pub struct DeleteBuilder {
     /// Commit properties and configuration
     commit_properties: CommitProperties,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    require_exact_row_count: bool,
 }
 
 impl std::fmt::Debug for DeleteBuilder {
@@ -236,6 +238,7 @@ impl DeleteBuilder {
             commit_properties: CommitProperties::default(),
             writer_properties: None,
             custom_execute_handler: None,
+            require_exact_row_count: false,
         }
     }
 
@@ -284,6 +287,11 @@ impl DeleteBuilder {
         self.custom_execute_handler = Some(handler);
         self
     }
+
+    pub(crate) fn with_exact_row_count(mut self) -> Self {
+        self.require_exact_row_count = true;
+        self
+    }
 }
 
 impl std::future::IntoFuture for DeleteBuilder {
@@ -330,7 +338,8 @@ impl std::future::IntoFuture for DeleteBuilder {
                 predicate: predicate.as_ref().map(fmt_expr_to_sql).transpose()?,
             };
 
-            let (actions, metrics) = execute(
+            let count_predicate = predicate.clone();
+            let (actions, mut metrics) = execute(
                 predicate,
                 this.log_store.clone(),
                 snapshot.clone(),
@@ -339,6 +348,18 @@ impl std::future::IntoFuture for DeleteBuilder {
                 this.writer_properties.clone(),
             )
             .await?;
+
+            if this.require_exact_row_count && metrics.num_deleted_rows.is_none() {
+                metrics.num_deleted_rows = Some(
+                    count_matching_rows(
+                        &session,
+                        this.log_store.clone(),
+                        snapshot.clone(),
+                        count_predicate,
+                    )
+                    .await?,
+                );
+            }
 
             // Do not make a commit when there are zero updates to the state
             if actions.is_empty() {
@@ -375,6 +396,25 @@ impl std::future::IntoFuture for DeleteBuilder {
             ))
         })
     }
+}
+
+async fn count_matching_rows(
+    session: &SessionState,
+    log_store: LogStoreRef,
+    snapshot: EagerSnapshot,
+    predicate: Option<Expr>,
+) -> DeltaResult<usize> {
+    let provider = crate::delta_datafusion::DeltaScanNext::new(
+        snapshot,
+        DeltaScanConfig::new_from_session(session),
+    )?
+    .with_log_store(log_store);
+    let context = SessionContext::new_with_state(session.clone());
+    let mut dataframe = context.read_table(Arc::new(provider))?;
+    if let Some(predicate) = predicate {
+        dataframe = dataframe.filter(predicate)?;
+    }
+    Ok(dataframe.count().await?)
 }
 
 #[derive(Clone, Debug)]

@@ -131,7 +131,7 @@ fn classify_path(path: &Path) -> RecordedPathKind {
     let path_str = path.as_ref();
     if path_str == "_delta_log" || path_str.starts_with("_delta_log/") {
         RecordedPathKind::Commit
-    } else if path_str.starts_with("part-") {
+    } else if path_str.ends_with(".parquet") {
         RecordedPathKind::Data
     } else {
         RecordedPathKind::Other
@@ -264,6 +264,12 @@ mod tests {
     fn classifies_checkpoint_paths() {
         let path = Path::from("_delta_log/00000000000000000010.checkpoint.parquet");
         assert_eq!(classify_path(&path), RecordedPathKind::Checkpoint);
+    }
+
+    #[test]
+    fn classifies_nested_parquet_paths_as_data() {
+        let path = Path::from("part=a/custom-name.parquet");
+        assert_eq!(classify_path(&path), RecordedPathKind::Data);
     }
 
     #[test]
